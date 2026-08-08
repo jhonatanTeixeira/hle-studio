@@ -1,0 +1,101 @@
+# Example target config for jhonatanTeixeira/portal_to_another_world - the
+# Sega Saturn/SH-2/Rust decompilation project this framework was extracted
+# from. This is a REFERENCE COPY for documentation only - all relative
+# paths below are written as if this file sits at THAT project's own root
+# (its real location), not inside hle-studio's examples/ dir. Copy the
+# content, don't run hle-studio from inside this examples/ directory.
+
+[target]
+name = "saturn-sh2-mkr"
+description = "Magic Knight Rayearth (Sega Saturn) SH-2 decompilation"
+isa = "sh2"
+output_language = "rust"
+
+[paths]
+native_functions_dir = "src/native_functions"
+layer_file_extension = "rs"
+test_file = "src/native_functions/behavior_tests.rs"
+studies_glob = "traces/calls/*_study.md"
+study_ready_marker = "## Interpretação"
+study_filename_regex = "^([0-9A-Fa-f]{8})_study\\.md$"
+reference_source_roots = [
+    "vendor/yabassanshiro/yabause/src",
+    "vendor/yabause/src",
+]
+
+[layers]
+order = [
+    "fixed_point_math", "struct_field_access", "geometry", "hardware_io",
+    "linked_structures", "entity_state", "flags_and_dispatch", "memory_utils",
+]
+[layers.titles]
+fixed_point_math = "Matemática de ponto fixo (Q16.16) e divisão/módulo"
+struct_field_access = "Leitura/escrita de campos de struct por offset"
+geometry = "Geometria, colisão e projeção de tela"
+hardware_io = "I/O de hardware (SMPC, CD block, VDP)"
+linked_structures = "Listas ligadas e tabelas encadeadas"
+entity_state = "Estado e ciclo de vida de entidades/objetos de jogo"
+flags_and_dispatch = "Flags, estado e dispatch de ações"
+memory_utils = "Utilitários de memória (cópia, extração de bits)"
+
+[build]
+build_cmd = ["cargo", "build"]
+test_cmd = ["cargo", "test", "native_functions"]
+build_cwd = "."
+
+[dispatch]
+strategy = "rust-match-table"
+table_file = "src/native_functions/mod.rs"
+# Must cover through the match block's own opening brace - see
+# hle_studio/config.py's dispatch_anchor docstring for why a
+# signature-only anchor is a real, previously-hit bug.
+anchor_string = "pub fn lookup(addr: u32) -> Option<NativeFn> {\n    match addr {"
+entry_template = "0x{addr} => Some({fn_ref}),"
+
+[extractor]
+strategy = "rust-regex"
+
+[judge]
+base_ruleset = "generic"
+project_rules_file = "judge_rules_project.md"
+
+[docs]
+playbook_file = "docs/native_port_playbook.md"
+
+[llm]
+agentgateway_base_url = "http://localhost:8080/v1"
+api_key_env = "AGENTGATEWAY_API_KEY"
+porting_model_alias = "porting-agent-model"
+judge_model_alias = "judge-model"
+# `draft`-specific override - validated live 2026-08-07 against a local
+# july-engine server (http://localhost:3000/v1/openai, no agentgateway
+# needed - it's already OpenAI-compatible) running first Gemma-4-E4B-it,
+# then Qwen3.5-4B (its TEXT_PRESETS alias there was "Your Kid"). Real
+# result: ~1.9k prompt / ~1.2k completion tokens per cluster, 8/12 clusters
+# parsed cleanly, the false-positive cluster from round 1 (limiar=0.35)
+# was gone after raising [clustering].threshold to 0.55 below. Swap this
+# whole [llm] section (base URL + both aliases) to point at a real
+# provider/agentgateway route for production `draft` runs - nothing else
+# in this pipeline changes, it's the same OpenAI-compatible contract either
+# way.
+draft_model_alias = "porting-agent-model"
+
+[trace]
+# Input to `draft` (hle-studio draft ...) - NOT used by `port`. The full
+# raw capture lives outside this repo (see CLAUDE.md's Runtime behavior
+# section) - point this at wherever portal_trace.c's PORTAL_TRACE_PATH
+# stream landed for a real play session.
+raw_trace_path = "traces/portal_trace_play.jsonl"
+ranker_strategy = "sh2-jsonl-call-frequency"
+mechanical_translator_strategy = "sh2-cfg-walk"
+game_binary_path = "extraction/0.BIN"
+game_binary_secondary_path = "extraction/IP.BIN"
+
+[clustering]
+# See hle_studio/semantic_clustering.py's module docstring for exactly why
+# these two values, not arbitrary: microsoft/graphcodebert-base measured as
+# clearly better-separating than microsoft/codebert-base on this project's
+# own proposals, and 0.55 (raised from an initial 0.35) fixed a real
+# false-positive merge of 3 unrelated functions found by direct inspection.
+model = "microsoft/graphcodebert-base"
+threshold = 0.55

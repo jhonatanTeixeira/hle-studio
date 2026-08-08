@@ -1,0 +1,30 @@
+[project]
+name = "hle-studio"
+version = "0.1.0"
+description = "Generic HLE-driven static-recompilation agent framework - extracted from the Saturn/SH-2/Rust pipeline in jhonatanTeixeira/portal_to_another_world. Ports already-studied CPU functions into real, compiling, tested target-language code, with a separate cheap judge model reviewing every diff against a fixed checklist."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic-ai>=0.0.1",
+    "pydantic-graph",
+    "pydantic>=2",
+    "httpx",
+    "openai",
+    "tomli; python_version < '3.11'",
+    "jinja2",
+]
+
+[project.optional-dependencies]
+# Only needed for `hle-studio draft`'s clustering step (semantic_clustering.py)
+# - kept optional because torch+transformers are a heavy, GPU-stack-specific
+# install that most `port`-only users of this package never need.
+clustering = ["torch", "transformers"]
+
+[project.scripts]
+hle-studio = "hle_studio.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["hle_studio*"]
