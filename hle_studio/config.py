@@ -81,6 +81,19 @@ class TargetConfig:
     idiom_table_doc: Path | None = None
     memory_map_doc: Path | None = None
     playbook_file: Path | None = None
+    # The REAL target-language API contract (exact function signature, real
+    # struct fields, 1-2 verbatim example functions already in the target
+    # codebase) - interpolated VERBATIM into draft_graph.py's system prompt,
+    # never described in prose. Added 2026-08-08 after a real, concrete
+    # failure: a model given only mechanical pseudocode (no API contract)
+    # invented its own hardware model from scratch - wrong struct, wrong
+    # endianness (little instead of the Saturn's real big-endian), delay
+    # slots dropped entirely. `port`'s agent avoids this because it has real
+    # file-reading tools to inspect the codebase live; `draft` is a single-
+    # shot prompt with no tool access, so it needs this handed to it
+    # directly - see the originating project's docs/native_api_foundation.md
+    # for the reference instance of what this file should contain.
+    api_foundation_doc: Path | None = None
 
     # [llm] - agentgateway is the intended transport; these are just the
     # aliases/URL this project expects, never a provider-specific key. Also
@@ -169,6 +182,7 @@ class TargetConfig:
             idiom_table_doc=_p(docs.get("idiom_table_doc")),
             memory_map_doc=_p(docs.get("memory_map_doc")),
             playbook_file=_p(docs.get("playbook_file")),
+            api_foundation_doc=_p(docs.get("api_foundation_doc")),
             llm_base_url=llm.get("agentgateway_base_url", "http://localhost:8080/v1"),
             llm_api_key_env=llm.get("api_key_env", "AGENTGATEWAY_API_KEY"),
             porting_model_alias=llm.get("porting_model_alias", "porting-agent-model"),

@@ -61,6 +61,8 @@ class DraftState:
     shared: DraftSharedContext
     targets: list[str] = field(default_factory=list)
     mechanical: dict[str, dict] = field(default_factory=dict)  # addr -> {"pseudo","resolved","note"}
+    dependencies: dict[str, set[str]] = field(default_factory=dict)  # addr -> {addr, ...} - IN this batch only
+    external_dependencies: dict[str, set[str]] = field(default_factory=dict)  # addr -> {addr, ...} - outside this batch
     clusters: list[list[str]] = field(default_factory=list)
     polished: dict[str, dict] = field(default_factory=dict)
 
@@ -78,7 +80,7 @@ class SelectTargets(BaseNode[DraftState]):
 
 @dataclass
 class MechanicalDisasm(BaseNode[DraftState]):
-    async def run(self, ctx: GraphRunContext[DraftState]) -> "ClusterPseudocode":
+    async def run(self, ctx: GraphRunContext[DraftState]) -> "BuildDependencyGraph":
         translator = ctx.state.shared.translator
         for addr in ctx.state.targets:
             result = translator.translate(addr)
@@ -86,7 +88,107 @@ class MechanicalDisasm(BaseNode[DraftState]):
         n_resolved = sum(1 for v in ctx.state.mechanical.values() if v["resolved"])
         print(f"[MechanicalDisasm] {len(ctx.state.mechanical)} funções desmontadas mecanicamente "
               f"({n_resolved} completas, {len(ctx.state.mechanical) - n_resolved} parciais) - 0 chamadas de LLM")
+        return BuildDependencyGraph()
+
+
+# Matches how translate_one_rust (sh2_to_rust_pseudo.py, the sh2_rust plugin's
+# emission backend) renders a call target - a static BSR/JSR-to-a-resolved-
+# address becomes `call_L<addr>()`, and a register-indirect JSR/BRAF/BSRF that
+# compact_pseudo's local constant substitution managed to resolve to a literal
+# becomes `call_dynamic(0x<addr>)`. Both forms carry the real target address
+# in the text itself - no need to touch MechanicalTranslator's own interface
+# to get dependency edges out of it; this is deliberately just a regex pass
+# over pseudocode that's already produced, same "don't invent a new capture
+# mechanism when the data already exists in another form" lesson as this
+# project's branch_targets_by_pc.json (see docs/ in the originating project).
+_CALL_TARGET_RE = re.compile(r"call_L([0-9A-Fa-f]{8})\(\)|call_dynamic\(0x([0-9A-Fa-f]{8})\)")
+
+
+def extract_call_targets(pseudo: str) -> set[str]:
+    """Every address this pseudocode calls, uppercase hex, deduplicated -
+    from the two regex forms above. A register-indirect call that compact
+    constant-propagation could NOT resolve to a literal is invisible here
+    (renders as `call_dynamic(rN)`) - a real, honest gap, not silently
+    guessed at; see MechanicalResult.note for whether the source function
+    itself was fully resolved."""
+    targets = set()
+    for m in _CALL_TARGET_RE.finditer(pseudo):
+        targets.add((m.group(1) or m.group(2)).upper())
+    return targets
+
+
+@dataclass
+class BuildDependencyGraph(BaseNode[DraftState]):
+    """Real call edges between the addresses in THIS batch, extracted from
+    the mechanical pseudocode already produced (zero extra disassembly, zero
+    LLM calls) - not a discovery mechanism like the originating project's
+    tools/expand_call_graph.py (which finds NEW addresses to study), but an
+    ORDERING one: which of the addresses we're ABOUT to draft call which
+    others we're ALSO about to draft, so ClusterPseudocode can process
+    callees before their callers and PolishWithLLM can tell the model
+    "this calls X, already drafted in this run as fn_x - reuse that name"
+    instead of the model inventing an unrelated one."""
+
+    async def run(self, ctx: GraphRunContext[DraftState]) -> "ClusterPseudocode":
+        in_batch = set(ctx.state.mechanical.keys())
+        for addr, m in ctx.state.mechanical.items():
+            called = extract_call_targets(m["pseudo"])
+            ctx.state.dependencies[addr] = called & in_batch
+            ctx.state.external_dependencies[addr] = called - in_batch
+        n_edges = sum(len(v) for v in ctx.state.dependencies.values())
+        n_external = sum(len(v) for v in ctx.state.external_dependencies.values())
+        print(f"[BuildDependencyGraph] {n_edges} dependências reais dentro do lote, "
+              f"{n_external} apontam pra fora do lote selecionado")
+
+        # Fan-in: addresses many OTHERS in this batch depend on - the "shared
+        # foundation" the docs/native_api_foundation.md doc talks about.
+        # Purely informational here (the topo order already processes these
+        # first regardless) - printed so a human watching the run sees which
+        # addresses are worth double-checking once drafted, since a mistake
+        # in one of these propagates into everything that reuses it.
+        fan_in: dict[str, int] = {}
+        for deps in ctx.state.dependencies.values():
+            for dep in deps:
+                fan_in[dep] = fan_in.get(dep, 0) + 1
+        shared = sorted((c, a) for a, c in fan_in.items() if c >= 2)
+        if shared:
+            top = ", ".join(f"{a} ({c}x)" for c, a in reversed(shared[-5:]))
+            print(f"[BuildDependencyGraph] endereços chamados por >=2 outros do lote (fundação "
+                  f"compartilhada, processados primeiro): {top}")
         return ClusterPseudocode()
+
+
+def _topo_order_clusters(clusters: list[list[str]], dependencies: dict[str, set[str]]) -> list[list[str]]:
+    """Kahn's algorithm at cluster granularity: cluster A must be processed
+    after cluster B if any address in A calls any address in B. Real code
+    has real cycles (mutual/indirect recursion) - a cycle can't be perfectly
+    serialized, so any cluster still blocked once nothing else is ready gets
+    appended in original order with a printed note, rather than silently
+    dropped or crashing."""
+    addr_to_cluster = {a: i for i, c in enumerate(clusters) for a in c}
+    cluster_deps: list[set[int]] = [set() for _ in clusters]
+    for i, cluster in enumerate(clusters):
+        for a in cluster:
+            for dep in dependencies.get(a, ()):
+                j = addr_to_cluster.get(dep)
+                if j is not None and j != i:
+                    cluster_deps[i].add(j)
+
+    order: list[int] = []
+    done = [False] * len(clusters)
+    remaining = set(range(len(clusters)))
+    while remaining:
+        ready = [i for i in remaining if cluster_deps[i] <= set(order)]
+        if not ready:
+            # Real cycle - break it by taking whatever's left in original
+            # order rather than guessing which edge to cut.
+            print(f"[ClusterPseudocode] {len(remaining)} cluster(s) em dependência cíclica - "
+                  f"processando na ordem original, sem tentar quebrar o ciclo")
+            ready = sorted(remaining)
+        for i in sorted(ready):
+            order.append(i)
+            remaining.discard(i)
+    return [clusters[i] for i in order]
 
 
 @dataclass
@@ -97,19 +199,20 @@ class ClusterPseudocode(BaseNode[DraftState]):
         try:
             from hle_studio.semantic_clustering import cluster_texts
             result = cluster_texts(payload, model_id=cfg.cluster_model, threshold=cfg.cluster_threshold)
-            ctx.state.clusters = result.clusters
-            print(f"[ClusterPseudocode] {len(payload)} propostas -> {len(result.clusters)} clusters "
+            clusters = result.clusters
+            print(f"[ClusterPseudocode] {len(payload)} propostas -> {len(clusters)} clusters "
                   f"(limiar={cfg.cluster_threshold})")
         except ImportError as e:
             # Real failure, visible, not silently papered over - fall back to
             # one cluster per address so the pipeline can still finish.
             print(f"[ClusterPseudocode] clustering indisponível ({e}) - 1 cluster por endereço")
-            ctx.state.clusters = [[a] for a in payload.keys()]
+            clusters = [[a] for a in payload.keys()]
+        ctx.state.clusters = _topo_order_clusters(clusters, ctx.state.dependencies)
         return PolishWithLLM()
 
 
 DRAFT_SYSTEM_PROMPT_TEMPLATE = """You are helping port {isa} code to {output_language} native code.
-
+{api_foundation_block}
 You receive mechanical pseudocode (NOT valid {output_language} - produced by an automatic,
 instruction-by-instruction transliterator with no real control-flow reconstruction) for one or more
 addresses that a semantic-duplicate detector (embedding similarity) grouped as likely the same real
@@ -134,6 +237,19 @@ Your task:
 """
 
 
+def _find_drafted(polished: dict, addr: str) -> dict | None:
+    """Looks up whether `addr` was already resolved by an earlier-processed
+    cluster in THIS run (dependency-ordered by _topo_order_clusters) -
+    returns that group's dict (fn_name/dispatch_entry) or None if it hasn't
+    been drafted yet (a forward/external/cyclic dependency - legitimate,
+    not an error; the model is simply not told about it)."""
+    for p in polished.values():
+        for g in p.get("groups", []):
+            if addr in g.get("addrs", []):
+                return g
+    return None
+
+
 def _extract_json(text: str) -> dict:
     text = text.strip()
     if text.startswith("```"):
@@ -147,23 +263,41 @@ class PolishWithLLM(BaseNode[DraftState]):
     async def run(self, ctx: GraphRunContext[DraftState]) -> "WriteOutput":
         shared = ctx.state.shared
         cfg = shared.config
+        api_foundation_block = ""
+        if cfg.api_foundation_doc and cfg.api_foundation_doc.exists():
+            api_foundation_block = (
+                "\n=== REAL target API contract - copy these signatures EXACTLY, never invent your own ===\n"
+                + cfg.api_foundation_doc.read_text(encoding="utf-8")
+                + "\n=== end of real API contract ===\n"
+            )
         system_prompt = DRAFT_SYSTEM_PROMPT_TEMPLATE.format(
             isa=cfg.isa, output_language=cfg.output_language,
+            api_foundation_block=api_foundation_block,
             dispatch_entry_template=cfg.dispatch_entry_template.format(addr="ADDR1 | 0xADDR2", fn_ref="module::fn_name"),
         )
         headers = {"Authorization": f"Bearer {shared.llm_api_key}"} if shared.llm_api_key else {}
         async with httpx.AsyncClient(timeout=300) as client:
             for i, cluster in enumerate(ctx.state.clusters):
                 bodies = []
+                dep_notes = []
                 for addr in cluster:
                     m = ctx.state.mechanical.get(addr)
                     if not m:
                         continue
                     bodies.append(f"--- {addr} ({'complete' if m['resolved'] else 'PARTIAL: ' + m['note']}) ---\n{m['pseudo']}")
+                    for dep in sorted(ctx.state.dependencies.get(addr, ())):
+                        drafted = _find_drafted(ctx.state.polished, dep)
+                        if drafted:
+                            dep_notes.append(f"- {addr} calls {dep}, already drafted earlier in THIS run as "
+                                              f"`{drafted['fn_name']}` ({drafted['dispatch_entry']}) - reuse that "
+                                              f"name/reference, don't invent a new one for the same address.")
                 if not bodies:
                     continue
+                dep_block = ("\n\nKnown dependencies already drafted in this run:\n" + "\n".join(dep_notes)
+                             if dep_notes else "")
                 user_prompt = (
-                    f"Suggested group - {len(cluster)} address(es): {', '.join(cluster)}\n\n" + "\n\n".join(bodies)
+                    f"Suggested group - {len(cluster)} address(es): {', '.join(cluster)}\n\n"
+                    + "\n\n".join(bodies) + dep_block
                 )
                 try:
                     resp = await client.post(
@@ -232,6 +366,8 @@ class WriteOutput(BaseNode[DraftState]):
             "mechanical": ctx.state.mechanical,
             "clusters": ctx.state.clusters,
             "polished": ctx.state.polished,
+            "dependencies": {a: sorted(d) for a, d in ctx.state.dependencies.items() if d},
+            "external_dependencies": {a: sorted(d) for a, d in ctx.state.external_dependencies.items() if d},
         }
         print(f"[WriteOutput] {summary['n_targets']} alvos -> {summary['n_mechanical']} desmontados -> "
               f"{summary['n_clusters']} clusters -> {summary['n_llm_calls']} chamadas ao LLM "
@@ -240,4 +376,4 @@ class WriteOutput(BaseNode[DraftState]):
         return End(summary)
 
 
-draft_graph = Graph(nodes=[SelectTargets, MechanicalDisasm, ClusterPseudocode, PolishWithLLM, WriteOutput])
+draft_graph = Graph(nodes=[SelectTargets, MechanicalDisasm, BuildDependencyGraph, ClusterPseudocode, PolishWithLLM, WriteOutput])

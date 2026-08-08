@@ -61,6 +61,13 @@ project_rules_file = "judge_rules_project.md"
 
 [docs]
 playbook_file = "docs/native_port_playbook.md"
+# Added 2026-08-08 after a real test (DeepSeek, no context) invented its own
+# hardware model (wrong struct, little-endian instead of the Saturn's real
+# big-endian, delay slots dropped) when given only mechanical pseudocode -
+# `draft` has no file-reading tools like `port`'s agent does, so it needs
+# the real NativeFn signature/Sh2Cpu fields/MemoryMap trait handed to it
+# directly. See that file's own header for the full story.
+api_foundation_doc = "docs/native_api_foundation.md"
 
 [llm]
 agentgateway_base_url = "http://localhost:8080/v1"
