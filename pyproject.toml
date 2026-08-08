@@ -4,8 +4,17 @@ version = "0.1.0"
 description = "Generic HLE-driven static-recompilation agent framework - extracted from the Saturn/SH-2/Rust pipeline in jhonatanTeixeira/portal_to_another_world. Ports already-studied CPU functions into real, compiling, tested target-language code, with a separate cheap judge model reviewing every diff against a fixed checklist."
 requires-python = ">=3.11"
 dependencies = [
-    "pydantic-ai>=0.0.1",
-    "pydantic-graph",
+    # Pinned exactly, not >=: graph.py/draft_graph.py use pydantic_graph's
+    # `Graph(nodes=[...])` constructor directly - a real, live break was
+    # hit installing this project fresh (2026-08-08): pydantic-graph 2.27.0
+    # requires 9 more positional args on Graph.__init__ (it's moved to a
+    # GraphBuilder-based API - see the deprecation warning this project's
+    # own imports already print). 1.107.0 is the version already proven
+    # working end-to-end against real DeepSeek/Gemma/Qwen runs in this
+    # project's own history - migrating to GraphBuilder is real, deliberate
+    # future work, not something to back into via an unpinned install.
+    "pydantic-ai==1.107.0",
+    "pydantic-graph==1.107.0",
     "pydantic>=2",
     "httpx",
     "openai",
