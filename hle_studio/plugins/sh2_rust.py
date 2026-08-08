@@ -15,7 +15,7 @@ from hle_studio.config import TargetConfig
 from hle_studio.plugins.base import MechanicalResult, MechanicalTranslator, TraceRanker
 from hle_studio.plugins.sh2 import sh2dis
 from hle_studio.plugins.sh2.cfg_walk import disassemble_function
-from hle_studio.plugins.sh2.sh2_to_rust_pseudo import translate_function
+from hle_studio.plugins.sh2.sh2_to_rust_pseudo import compact_pseudo, translate_function
 
 
 class Sh2RustTraceRanker(TraceRanker):
@@ -71,5 +71,7 @@ class Sh2RustMechanicalTranslator(MechanicalTranslator):
         addr = int(addr_hex, 16)
         blocks, all_resolved, note = disassemble_function(addr, self._binary_data())
         decs = [d for block in blocks for d in block]
-        pseudo_lines = translate_function(decs)
+        # compact_pseudo(): this feeds an LLM prompt downstream (draft_graph's
+        # PolishWithLLM) - real, measured token cost, not just tidiness.
+        pseudo_lines = compact_pseudo(translate_function(decs))
         return MechanicalResult(pseudo="\n".join(pseudo_lines), resolved=all_resolved, note=note)

@@ -30,6 +30,12 @@ Usage (same input shape sh2dis.decode() already produces):
     # e.g. addresses copied straight out of a traces/calls/<ADDR>_study.md
     # disassembly block, for a quick "what would this look like as
     # pseudocode" spot-check without opening the Rust proposal.
+    #
+    # Output is COMPACT by default (compact_pseudo() - unused labels/nops
+    # dropped, sr_t+if fused, local constant substitution within a block,
+    # a real ~50%+ line-count cut with no semantic loss - see that
+    # function's own docstring for exactly what it does and doesn't do).
+    # Pass --raw for the uncompacted 1:1 audit trail instead.
 """
 import re
 import sys
@@ -510,28 +516,266 @@ def translate_one_rust(dec, tr: Translator, is_delay_slot: bool = False) -> list
     return lines
 
 
+_DELAY_SLOT_PREFIXES = ("BRA", "BSR", "BRAF", "BSRF", "JSR", "JMP")
+
+
+def _branch_target_register(mnemonic: str) -> str | None:
+    """The register a JMP/JSR/BRAF/BSRF reads as its target, or None for a
+    static-displacement BRA/BSR (no register dependency to worry about)."""
+    m = re.match(r"^(?:JMP|JSR) @R(\d+)$", mnemonic) or re.match(r"^(?:BRAF|BSRF) R(\d+)$", mnemonic)
+    return m.group(1) if m else None
+
+
+_NO_REGISTER_DEST_PREFIXES = (
+    "MOV.B R", "MOV.W R", "MOV.L R",  # store forms: "MOV.* Rn,@..." - writes memory, not a register
+    "NOP", "TST", "CMP/", "TRAPA",
+)
+
+
+def _delay_slot_dest_register(mnemonic: str) -> str | None:
+    """The register a delay-slot instruction writes to, for the ONE thing
+    that matters here - whether reordering it ahead of its branch would
+    change which value a register-indirect branch reads as its target.
+
+    Three-way, not boolean, on purpose:
+      - a register number string: writes exactly that register.
+      - "" (empty string): confidently writes NO register at all (a memory
+        store, a comparison that only sets sr_t, TRAPA, NOP) - can never
+        collide with a branch's target register, safe to reorder regardless
+        of what that target register is.
+      - None: genuinely don't know - conservative default, caller must NOT
+        reorder rather than guess (this project's don't-guess rule)."""
+    if mnemonic.startswith(_NO_REGISTER_DEST_PREFIXES):
+        return ""
+    m = re.match(r"^MOV(?:\.[BWL])? (?:#-?\d+|R\d+),R(\d+)$", mnemonic)
+    if m:
+        return m.group(1)
+    m = re.match(r"^MOV\.[BWL] @\S+,R(\d+)$", mnemonic)  # load forms
+    if m:
+        return m.group(1)
+    return None
+
+
 def translate_function(decs) -> list[str]:
-    """Same per-function driver shape as sh2_to_x86.translate_function:
-    one Translator across the whole straight-line instruction list, one
-    `L<addr>:` label per instruction so BRA/BSR/BT/BF targets resolve to a
-    real anchor even though there's no real block/loop reconstruction here."""
+    """Same per-function driver shape as sh2_to_x86.translate_function: one
+    Translator across the whole straight-line instruction list.
+
+    Two differences from a pure 1:1 transliteration, both correctness/
+    readability fixes rather than cosmetic ones (external review, 2026-08-08
+    - see this project's history for the discussion):
+
+    1. Delay-slot reordering: real SH-2 hardware executes a delay slot
+       instruction's effect BEFORE the branch/call it follows takes effect,
+       even though the delay slot instruction comes AFTER the branch in
+       address order. Emitting them in address order (as a straight 1:1
+       transliteration would) makes the pseudocode read backwards from real
+       execution order. Swapped here UNLESS the delay-slot instruction
+       writes to the exact same register the branch reads as its indirect
+       target (e.g. `JMP @R3` with delay slot `MOV R5,R3`) - real hardware
+       latches the target register's value at the branch instruction itself,
+       BEFORE the delay slot's write, so blindly reordering that specific
+       case would make the pseudocode imply it jumps to the NEW value when
+       hardware actually used the OLD one. Flagged with a comment instead of
+       silently getting it wrong when detected; left in original order with
+       a note when the delay-slot instruction's destination can't be
+       confidently determined (conservative default).
+    2. Only jump/call targets that are ACTUALLY referenced get a label -
+       labeling every single instruction (the previous behavior) is pure
+       noise; unused labels are stripped in a second pass with zero semantic
+       risk (a label is just an anchor, never executed)."""
     tr = Translator()
+    raw_out = []  # [(addr_or_None, line), ...] - addr on the label line itself
+    i = 0
+    n = len(decs)
+    while i < n:
+        dec = decs[i]
+        has_delay = dec.mnemonic.split()[0] in _DELAY_SLOT_PREFIXES and i + 1 < n
+        if has_delay:
+            delay_dec = decs[i + 1]
+            branch_reg = _branch_target_register(dec.mnemonic)
+            delay_dest = _delay_slot_dest_register(delay_dec.mnemonic)
+            # Safe to reorder (delay-slot effect first, matching real
+            # hardware execution order) UNLESS the branch reads a register
+            # as its target AND we can't positively rule out the delay slot
+            # writing that exact register - collision (unsafe) or unknown
+            # (be conservative) both keep the original address order.
+            safe_to_reorder = branch_reg is None or (delay_dest is not None and delay_dest != branch_reg)
+            raw_out.append((dec.addr, f"L{dec.addr:08X}:"))
+            if not safe_to_reorder and branch_reg is not None and delay_dest == branch_reg:
+                raw_out.append((None, f"    // ATENÇÃO: delay slot escreve no mesmo registrador ({r(int(branch_reg))}) "
+                                       f"usado como alvo do desvio - hardware usa o valor ANTIGO (lido antes do "
+                                       f"delay slot executar), mantendo ordem de endereço abaixo para não sugerir o contrário"))
+            first, second = (delay_dec, dec) if safe_to_reorder else (dec, delay_dec)
+            for line in translate_one_rust(first, tr, is_delay_slot=(first is delay_dec)):
+                raw_out.append((None, f"    {line}"))
+            for line in translate_one_rust(second, tr, is_delay_slot=(second is delay_dec)):
+                raw_out.append((None, f"    {line}"))
+            i += 2
+        else:
+            raw_out.append((dec.addr, f"L{dec.addr:08X}:"))
+            for line in translate_one_rust(dec, tr, is_delay_slot=False):
+                raw_out.append((None, f"    {line}"))
+            i += 1
+    return [line for _addr, line in raw_out]
+
+
+_ASSIGN_LITERAL_RE = re.compile(r"^\s*(r\d+) = (0x[0-9A-Fa-f]+|\d+u32);$")
+_ASSIGN_ANY_RE = re.compile(r"^\s*(r\d+) [+\-*/&|^]?= |^\s*(r\d+) <<=|^\s*(r\d+) >>=")
+_CALL_LINE_RE = re.compile(r"call_dynamic\(|call_L[0-9A-F]{8}\(\)|goto \*\(")
+# Registers a call can plausibly clobber without us tracking it - conservative:
+# ALL of them, not just R0. A real, previously-latent gap this fixes: the
+# existing Translator (used during raw emission, for hw-register recognition)
+# never invalidated ANY register across a JSR/BSR/BSRF/dynamic-jump - meaning
+# even the raw output could already treat a post-call register read as if it
+# still held its pre-call constant. Silently propagating that into displayed
+# literal substitutions (below) would have made a latent bug visibly wrong
+# instead of just an unused, dormant miscalculation - so every known constant
+# is dropped at every call site, not just the ones a specific ABI would clobber.
+
+
+def compact_pseudo(lines: list[str]) -> list[str]:
+    """Display-only convenience pass over translate_function's raw output -
+    the raw form (kept as its own artifact, --raw) remains the audit trail
+    tying every line back to one real opcode; this is derived from it, never
+    a replacement source of truth. Textual peephole steps, each independently
+    safe, applied in this order:
+
+    1. Drop unreferenced labels (a label is a pure anchor - dropping one
+       that's genuinely never jumped to changes nothing about execution).
+    2. Drop `// nop` lines.
+    3. Fuse an adjacent `sr_t = EXPR;` + `if [!]sr_t {...}` pair into one
+       `if [!](EXPR) {...}` (see the negation-bug comment below - tested
+       wrong once before being fixed).
+    4. Simplify the `Ni32 as u32` literal noise from immediate-MOV emission.
+    5. LOCAL constant substitution: when a register is assigned a literal
+       and then read before being reassigned, substitute the literal inline
+       and drop the now-dead assignment. Deliberately scoped to be safe, not
+       merely convenient:
+       - Reset entirely at every KEPT label (every kept label is a real
+         join point/block boundary after step 1 - an unreferenced label
+         was pure straight-line continuation, safe to track across; a kept
+         one might be reached from more than one predecessor with a
+         different register value, so tracking never crosses it).
+       - Invalidated by ANY call/dynamic-jump line (see _CALL_LINE_RE) -
+         closes a real gap in the Translator class itself (see the module
+         comment above), not just a defensive add-on here.
+       - Invalidated the instant a register is reassigned by anything
+         OTHER than a plain literal (compound assignment, a memory read,
+         another register's value, etc.) - only ever substitutes a value
+         this pass is still certain is live and unchanged."""
+    referenced = set(re.findall(r"\b(?:goto|call_)L([0-9A-F]{8})", "\n".join(lines)))
+    kept = []
+    for line in lines:
+        m = re.match(r"^L([0-9A-F]{8}):$", line)
+        if m and m.group(1) not in referenced:
+            continue
+        if line.strip() == "// nop":
+            continue
+        line = re.sub(r"\b(\d+)i32 as u32\b", r"\1u32", line)
+        kept.append(line)
+
+    fused = []
+    i = 0
+    while i < len(kept):
+        m = re.match(r"^\s*sr_t = (.+);$", kept[i])
+        if m and i + 1 < len(kept):
+            nxt = re.match(r"^\s*if (!?)sr_t \{ (goto L[0-9A-F]{8};) \}(.*)$", kept[i + 1])
+            if nxt:
+                cond = m.group(1)
+                negate, goto_stmt, trailing = nxt.groups()
+                # negate is "!" for "if !sr_t" (branch-if-false), "" for
+                # plain "if sr_t" (branch-if-true) - the fused condition
+                # carries the SAME negation, not its opposite (a real bug
+                # caught in testing: an earlier version of this line
+                # inverted the sense, turning BT into BF's logic).
+                fused.append(f"    if {negate}({cond}) {{ {goto_stmt} }}{trailing}")
+                i += 2
+                continue
+        fused.append(kept[i])
+        i += 1
+
+    known = {}  # reg -> literal text, live within the current block only
+    pending_def = {}  # reg -> index into `out` of its (possibly dead) definition line
     out = []
-    for i, dec in enumerate(decs):
-        out.append(f"L{dec.addr:08X}:")
-        is_delay = decs[i - 1].mnemonic.split()[0] in ("BRA", "BSR", "BRAF", "BSRF", "JSR", "JMP") if i > 0 else False
-        for line in translate_one_rust(dec, tr, is_delay_slot=is_delay):
-            out.append(f"    {line}")
-    return out
+    for line in fused:
+        if re.match(r"^L[0-9A-F]{8}:$", line):
+            known.clear()
+            pending_def.clear()
+            out.append(line)
+            continue
+        if _CALL_LINE_RE.search(line):
+            # Substitute into the call's OWN line first (e.g. the target
+            # register in `call_dynamic(r3)` is itself a read worth
+            # resolving), using state as of BEFORE this call - only clear
+            # afterward, for what follows. Getting this order backwards
+            # (clear-then-append, an earlier version of this code) silently
+            # dropped exactly the substitution that mattered most: the call
+            # target itself.
+            subbed = line
+            for reg, lit in known.items():
+                if re.search(rf"\b{reg}\b", line):
+                    subbed = re.sub(rf"\b{reg}\b", lit, subbed)
+                    if reg in pending_def:
+                        out[pending_def[reg]] = None
+            known.clear()
+            pending_def.clear()
+            out.append(subbed)
+            continue
+        assign_m = _ASSIGN_LITERAL_RE.match(line)
+        if assign_m:
+            reg, lit = assign_m.groups()
+            known[reg] = lit
+            pending_def[reg] = len(out)
+            out.append(line)
+            continue
+        # Split off any "rN <op>= " assignment prefix BEFORE substituting -
+        # substitution must never touch the LHS/target register position,
+        # only genuine reads. A real bug caught in testing: an earlier
+        # version regex-substituted the whole line blindly, so a
+        # self-referential update like `r3 = r3 as i16 as i32 as u32;`
+        # (reading and rewriting the same register - common in this
+        # pipeline's sign-extend emission) replaced BOTH occurrences,
+        # producing nonsense like `0x100 = 0x100 as i16...`.
+        prefix_m = re.match(r"^(\s*r\d+\s*(?:[+\-&|^]?=|<<=|>>=)\s*)(.*)$", line)
+        head, rhs = (prefix_m.group(1), prefix_m.group(2)) if prefix_m else ("", line)
+        subbed_rhs = rhs
+        for reg, lit in known.items():
+            if re.search(rf"\b{reg}\b", rhs):
+                # This register is read here - substitute, and the earlier
+                # pure-literal definition line becomes dead (every read of
+                # it in this block is substituted the same way, so nothing
+                # ever reads the register directly again before it's
+                # reassigned) - blank it out rather than shift indices.
+                subbed_rhs = re.sub(rf"\b{reg}\b", lit, subbed_rhs)
+                if reg in pending_def:
+                    out[pending_def[reg]] = None  # mark dead, filtered at the end
+                    del pending_def[reg]
+        subbed = head + subbed_rhs
+        reassign_m = _ASSIGN_ANY_RE.match(line) or re.match(r"^\s*(r\d+) = ", line)
+        if reassign_m:
+            reg = next(g for g in reassign_m.groups() if g)
+            known.pop(reg, None)
+            pending_def.pop(reg, None)
+        out.append(subbed)
+    return [line for line in out if line is not None]
 
 
 def main():
-    if len(sys.argv) < 3 or len(sys.argv) % 2 != 1:
+    # Compact is the DEFAULT output (2026-08-08: raw 1:1 was burning real
+    # token budget for anyone downstream reading this - a real, measured
+    # ~50%+ line-count cut with no semantic loss). Pass --raw for the
+    # uncompacted 1:1 audit trail instead.
+    want_raw = "--raw" in sys.argv
+    argv = [a for a in sys.argv if a not in ("--raw", "--compact")]
+    if len(argv) < 3 or len(argv) % 2 != 1:
         print(__doc__)
         sys.exit(1)
-    pairs = [(int(sys.argv[i], 16), int(sys.argv[i + 1], 16)) for i in range(1, len(sys.argv), 2)]
+    pairs = [(int(argv[i], 16), int(argv[i + 1], 16)) for i in range(1, len(argv), 2)]
     decs = [decode(pc, op) for pc, op in pairs]
-    for line in translate_function(decs):
+    lines = translate_function(decs)
+    if not want_raw:
+        lines = compact_pseudo(lines)
+    for line in lines:
         print(line)
 
 
