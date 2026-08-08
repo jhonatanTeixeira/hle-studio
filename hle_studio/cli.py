@@ -132,9 +132,19 @@ async def _run_draft(args):
     print(f"endpoint: {args.base_url}  model: {args.model}  clustering: {config.cluster_model} "
           f"(threshold={config.cluster_threshold})")
     trace_ranker, translator = _resolve_draft_plugins(config)
+    dispatch_editor = extractor = build_runner = None
+    if args.write:
+        # Same plugin trio `port` already trusts - resolved only when
+        # --write is actually passed, never speculatively (this mutates the
+        # real working tree + runs a real build/test, see WriteAndVerify's
+        # own docstring for exactly why that gate exists).
+        dispatch_editor, extractor, build_runner = _resolve_plugins(config)
+        print("--write ativo: vai escrever nos arquivos reais + rodar build/test de verdade")
     shared = DraftSharedContext(
         config=config, trace_ranker=trace_ranker, translator=translator,
         llm_base_url=args.base_url, llm_model_alias=args.model, llm_api_key=args.api_key, top_n=args.top,
+        dispatch_editor=dispatch_editor, extractor=extractor, build_runner=build_runner,
+        write_and_verify=args.write,
     )
     state = DraftState(shared=shared)
     end = await draft_graph.run(SelectTargets(), state=state)
@@ -174,6 +184,9 @@ def main():
     draft_p.add_argument("--base-url", type=str, default=os.environ.get("HLE_DRAFT_BASE_URL", "http://localhost:8080/v1"))
     draft_p.add_argument("--api-key", type=str, default=os.environ.get("HLE_DRAFT_API_KEY", "placeholder"))
     draft_p.add_argument("--out-dir", type=str, default=None)
+    draft_p.add_argument("--write", action="store_true",
+                          help="write drafted functions into the real layer files + dispatch table, then run a "
+                               "real build/test - OFF by default, this mutates the real working tree")
 
     args = parser.parse_args()
     if args.command == "port":

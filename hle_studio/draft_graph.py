@@ -42,7 +42,7 @@ import httpx
 from pydantic_graph import BaseNode, End, Graph, GraphRunContext
 
 from hle_studio.config import TargetConfig
-from hle_studio.plugins.base import MechanicalTranslator, TraceRanker
+from hle_studio.plugins.base import BuildRunner, DispatchEditor, FunctionExtractor, MechanicalTranslator, TraceRanker
 
 
 @dataclass
@@ -54,6 +54,13 @@ class DraftSharedContext:
     llm_model_alias: str
     llm_api_key: str = "placeholder"
     top_n: int = 20
+    # Only needed if `write_and_verify` is True (see WriteAndVerify's own
+    # docstring for why this is opt-in, never automatic) - the SAME plugin
+    # trio the `port` graph uses, reused rather than reforked.
+    dispatch_editor: DispatchEditor | None = None
+    extractor: FunctionExtractor | None = None
+    build_runner: BuildRunner | None = None
+    write_and_verify: bool = False
 
 
 @dataclass
@@ -65,6 +72,7 @@ class DraftState:
     external_dependencies: dict[str, set[str]] = field(default_factory=dict)  # addr -> {addr, ...} - outside this batch
     clusters: list[list[str]] = field(default_factory=list)
     polished: dict[str, dict] = field(default_factory=dict)
+    summary: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -224,16 +232,23 @@ proof. Before writing anything, read every address's pseudocode yourself and dec
 grouping suggested one, and do not spiral into unresolved back-and-forth in a comment if a case looks
 ambiguous: pick your best-supported reading, note the uncertainty in ONE line, and move on.
 
+This project organizes native functions into fixed layers/modules - one file per layer, real ones
+already exist in the codebase, you're placing new code into one of them, never inventing your own
+module path or writing a bare unqualified reference:
+{layers_block}
+
 Your task:
 1. Re-derive the real subgroups (1 subgroup covering everyone, or up to N subgroups if none share logic).
 2. For each real subgroup, write ONE {output_language} function capturing ONLY what the pseudocode
    actually shows - never invent logic, and never invent methods/APIs that weren't in the pseudocode.
-3. For each subgroup, the dispatch-table entry in EXACTLY this format (substitute the real address(es)
-   and function reference, change nothing else about the shape): `{dispatch_entry_template}`
+3. For each subgroup, pick the SINGLE best-fitting `layer` from the list above by its exact key (e.g.
+   "hardware_io") - never a path you invent, never "crate::...", never a bare function with no layer.
 4. Respond with strict JSON, a list of subgroups even if there's only one:
-   {{"groups": [{{"addrs": ["ADDR1","ADDR2"], "code": "...", "dispatch_entry": "...", "fn_name": "...",
+   {{"groups": [{{"addrs": ["ADDR1","ADDR2"], "code": "...", "fn_name": "...", "layer": "hardware_io",
                  "split_reason": "only fill in if you split the suggested grouping - say why"}}]}}
-   No markdown, no ```, JSON only.
+   No markdown, no ```, JSON only. Do NOT include a "dispatch_entry" field - the exact dispatch-table
+   line is assembled mechanically from your `layer` + `fn_name`, never from text you write, so it can
+   never come out malformed.
 """
 
 
@@ -248,6 +263,37 @@ def _find_drafted(polished: dict, addr: str) -> dict | None:
             if addr in g.get("addrs", []):
                 return g
     return None
+
+
+def _compute_dispatch_entry(cfg: TargetConfig, group: dict) -> str:
+    """Assembles the real dispatch-table line mechanically from the model's
+    `layer` + `fn_name` choice - never from a `dispatch_entry` string the
+    model wrote itself. A real, twice-observed failure mode this replaces:
+    asked to write the dispatch line as free text, the model produced FOUR
+    different module-path conventions across one 15-address run
+    (`hardware_io::fn`, `crate::native_functions::fn`, `native_functions::fn`,
+    and bare `fn` with no module at all) - none of which is guaranteed to
+    even compile, since draft doesn't know which module a function will
+    really live in. Constraining the model to pick a `layer` NAME from a
+    fixed list (a discrete choice, not free text) and computing the path
+    ourselves makes a malformed dispatch entry structurally impossible."""
+    layer = group.get("layer", "")
+    if layer not in cfg.layer_names():
+        # Doesn't guess a different layer - flags the entry as needing a
+        # real decision instead of silently picking the first one.
+        group["layer_warning"] = f"model returned unknown layer {layer!r}, not one of {cfg.layer_names()}"
+        layer = layer or "UNKNOWN_LAYER"
+    addrs = group.get("addrs", [])
+    # dispatch_entry_template already has a literal "0x" before {addr} (e.g.
+    # "0x{addr} => Some({fn_ref}),") - meant for a single bare hex address.
+    # For a multi-address match arm the real Rust shape is
+    # `0xA | 0xB | 0xC => ...`, each with its own "0x" - so the FIRST
+    # address stays bare (the template's fixed "0x" covers it) and every
+    # address after gets its own explicit "0x" prefix, or the template
+    # would silently duplicate/omit a prefix.
+    addr = " | ".join([addrs[0]] + [f"0x{a}" for a in addrs[1:]]) if addrs else "00000000"
+    fn_name = group.get("fn_name", "unnamed")
+    return cfg.dispatch_entry_template.format(addr=addr, fn_ref=f"{layer}::{fn_name}")
 
 
 def _extract_json(text: str) -> dict:
@@ -270,10 +316,11 @@ class PolishWithLLM(BaseNode[DraftState]):
                 + cfg.api_foundation_doc.read_text(encoding="utf-8")
                 + "\n=== end of real API contract ===\n"
             )
+        layers_block = "\n".join(f"- {l.name}: {l.title}" for l in cfg.layers) or "- (no layers configured)"
         system_prompt = DRAFT_SYSTEM_PROMPT_TEMPLATE.format(
             isa=cfg.isa, output_language=cfg.output_language,
             api_foundation_block=api_foundation_block,
-            dispatch_entry_template=cfg.dispatch_entry_template.format(addr="ADDR1 | 0xADDR2", fn_ref="module::fn_name"),
+            layers_block=layers_block,
         )
         headers = {"Authorization": f"Bearer {shared.llm_api_key}"} if shared.llm_api_key else {}
         async with httpx.AsyncClient(timeout=300) as client:
@@ -325,6 +372,8 @@ class PolishWithLLM(BaseNode[DraftState]):
                     usage = resp_json.get("usage", {})
                     content = resp_json["choices"][0]["message"]["content"]
                     groups = _extract_json(content).get("groups", [])
+                    for g in groups:
+                        g["dispatch_entry"] = _compute_dispatch_entry(cfg, g)
                 except Exception as e:  # noqa: BLE001 - a failed cluster is reported, not silently dropped
                     groups = [{"addrs": cluster, "code": f"// LLM FAILED: {e}", "dispatch_entry": "", "fn_name": "error"}]
                     usage = {}
@@ -338,7 +387,7 @@ class PolishWithLLM(BaseNode[DraftState]):
 
 @dataclass
 class WriteOutput(BaseNode[DraftState]):
-    async def run(self, ctx: GraphRunContext[DraftState]) -> End[dict]:
+    async def run(self, ctx: GraphRunContext[DraftState]) -> "WriteAndVerify | End[dict]":
         total_prompt_tok, total_completion_tok, n_splits = 0, 0, 0
         code_blocks, dispatch_entries = [], []
         for key, p in ctx.state.polished.items():
@@ -373,7 +422,107 @@ class WriteOutput(BaseNode[DraftState]):
               f"{summary['n_clusters']} clusters -> {summary['n_llm_calls']} chamadas ao LLM "
               f"({summary['n_model_splits']} split(s)). "
               f"TOKENS: {total_prompt_tok} entrada / {total_completion_tok} saída.")
+        ctx.state.summary = summary
+        if ctx.state.shared.write_and_verify:
+            return WriteAndVerify()
         return End(summary)
 
 
-draft_graph = Graph(nodes=[SelectTargets, MechanicalDisasm, BuildDependencyGraph, ClusterPseudocode, PolishWithLLM, WriteOutput])
+@dataclass
+class WriteAndVerify(BaseNode[DraftState]):
+    """Opt-in only (DraftSharedContext.write_and_verify, CLI `--write`) -
+    NEVER runs by default. Writes each drafted group into its real layer
+    file + inserts its dispatch entry, using the SAME DispatchEditor/
+    FunctionExtractor the `port` graph already trusts (not reforked), then
+    runs a real `cargo build` + `cargo test` and reports pass/fail.
+
+    This is NOT the judge review `port` does (no separate model checking
+    conventions/gotchas) - it's the one gate that's non-negotiable regardless:
+    a real, live-observed case (2026-08-08) had `draft` output that compiled
+    clean but pushed the WRONG value to the stack (a shadowed `let` binding
+    silently overwrote a saved register before it was used) - Rust's own
+    compiler doesn't catch that, only a real test with real register values
+    would. Skipping straight from `draft` to a trusted dispatch table
+    without at least this gate would let exactly that class of bug in
+    silently."""
+
+    async def run(self, ctx: GraphRunContext[DraftState]) -> End[dict]:
+        shared = ctx.state.shared
+        cfg = shared.config
+        if not (shared.dispatch_editor and shared.extractor and shared.build_runner):
+            ctx.state.summary["write_error"] = "write_and_verify=True but dispatch_editor/extractor/build_runner not set"
+            print(f"[WriteAndVerify] {ctx.state.summary['write_error']} - nada escrito")
+            return End(ctx.state.summary)
+
+        table_path = cfg.dispatch_table_file
+        table_content = table_path.read_text(encoding="utf-8") if table_path.exists() else ""
+        written_files, skipped, dispatch_inserted = [], [], []
+
+        for key, p in ctx.state.polished.items():
+            for g in p.get("groups", []):
+                fn_name = g.get("fn_name")
+                layer = g.get("layer")
+                code = g.get("code", "")
+                if not fn_name or layer not in cfg.layer_names() or not code.strip():
+                    skipped.append({"key": key, "reason": g.get("layer_warning") or "missing fn_name/layer/code"})
+                    continue
+                layer_path = cfg.native_functions_dir / f"{layer}.{cfg.layer_file_extension}"
+                existing = layer_path.read_text(encoding="utf-8") if layer_path.exists() else ""
+                if shared.extractor.fn_name_in(existing, fn_name):
+                    skipped.append({"key": key, "reason": f"{fn_name} já existe em {layer_path.name} - não sobrescrito"})
+                    continue
+                addrs = g.get("addrs") or ["00000000"]
+                # insert_entry only takes ONE address per call - a multi-
+                # address group (`0xA | 0xB => Some(fn)`) needs one call per
+                # address, not just the first (a real bug caught before this
+                # ever ran: the first version silently dropped every address
+                # after addrs[0] from the dispatch table).
+                already = [a for a in addrs if shared.dispatch_editor.address_already_registered(table_content, a)]
+                if already:
+                    skipped.append({"key": key, "reason": f"endereço(s) {already} já registrado(s) na tabela de dispatch"})
+                    continue
+                new_content = existing.rstrip() + f"\n\n// {key} - drafted by hle-studio, not yet judge-reviewed\n{code}\n"
+                layer_path.write_text(new_content, encoding="utf-8")
+                written_files.append(str(layer_path))
+                # NOTE: this produces N separate single-address match arms
+                # for a multi-address group, not one consolidated
+                # `0xA | 0xB => Some(fn)` arm (DispatchEditor.insert_entry's
+                # real signature only takes one address per call) - still
+                # correct Rust, just not the terser style the codebase
+                # prefers for genuine near-duplicates; consolidating is
+                # real follow-up work for DispatchEditor itself, not solved
+                # here.
+                for a in addrs:
+                    table_content = shared.dispatch_editor.insert_entry(table_content, a, layer, fn_name)
+                dispatch_inserted.append(g["dispatch_entry"])
+
+        if dispatch_inserted:
+            table_path.write_text(table_content, encoding="utf-8")
+            written_files.append(str(table_path))
+
+        build_ok, build_tail = shared.build_runner.build()
+        test_ok, test_tail = (False, "(build falhou, teste não rodou)")
+        if build_ok:
+            test_ok, test_tail = shared.build_runner.test()
+
+        ctx.state.summary["write_and_verify"] = {
+            "written_files": written_files,
+            "skipped": skipped,
+            "dispatch_inserted": dispatch_inserted,
+            "build_ok": build_ok,
+            "test_ok": test_ok,
+            "build_tail": build_tail,
+            "test_tail": test_tail,
+        }
+        print(f"[WriteAndVerify] {len(dispatch_inserted)} função(ões) escrita(s) em {len(written_files)} arquivo(s), "
+              f"{len(skipped)} pulada(s). build={'OK' if build_ok else 'FALHOU'}, "
+              f"test={'OK' if test_ok else 'FALHOU'}")
+        if not build_ok:
+            print(f"[WriteAndVerify] cauda do build:\n{build_tail}")
+        elif not test_ok:
+            print(f"[WriteAndVerify] cauda do teste:\n{test_tail}")
+        return End(ctx.state.summary)
+
+
+draft_graph = Graph(nodes=[SelectTargets, MechanicalDisasm, BuildDependencyGraph, ClusterPseudocode, PolishWithLLM,
+                            WriteOutput, WriteAndVerify])
