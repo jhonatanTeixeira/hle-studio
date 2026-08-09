@@ -34,6 +34,7 @@ for exact repro):
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field
@@ -199,6 +200,43 @@ def _topo_order_clusters(clusters: list[list[str]], dependencies: dict[str, set[
     return [clusters[i] for i in order]
 
 
+def _topo_waves(clusters: list[list[str]], dependencies: dict[str, set[str]]) -> list[list[int]]:
+    """Same Kahn's-algorithm dependency graph as `_topo_order_clusters`, but
+    returns the *waves* (each a list of cluster-indices with no dependency
+    on each other, or on anything not already in an earlier wave) instead of
+    flattening them into one order. This is what makes concurrent
+    `PolishWithLLM` calls safe: every cluster within one wave is provably
+    independent of every other cluster in that same wave, so firing them all
+    at once can never race a caller against a callee it needs the drafted
+    name of - `ctx.state.polished` is only ever read from PRIOR, fully-
+    completed waves, never from wave-mates still in flight. Real cycles get
+    the same fallback as `_topo_order_clusters`: whatever's left becomes one
+    final wave, processed concurrently since there's no ordering left to
+    respect among them anyway."""
+    addr_to_cluster = {a: i for i, c in enumerate(clusters) for a in c}
+    cluster_deps: list[set[int]] = [set() for _ in clusters]
+    for i, cluster in enumerate(clusters):
+        for a in cluster:
+            for dep in dependencies.get(a, ()):
+                j = addr_to_cluster.get(dep)
+                if j is not None and j != i:
+                    cluster_deps[i].add(j)
+
+    waves: list[list[int]] = []
+    done: set[int] = set()
+    remaining = set(range(len(clusters)))
+    while remaining:
+        ready = [i for i in remaining if cluster_deps[i] <= done]
+        if not ready:
+            print(f"[PolishWithLLM] {len(remaining)} cluster(s) em dependência cíclica - "
+                  f"tratando como uma onda final só, sem tentar quebrar o ciclo")
+            ready = sorted(remaining)
+        waves.append(sorted(ready))
+        done.update(ready)
+        remaining.difference_update(ready)
+    return waves
+
+
 @dataclass
 class ClusterPseudocode(BaseNode[DraftState]):
     async def run(self, ctx: GraphRunContext[DraftState]) -> "PolishWithLLM":
@@ -236,6 +274,18 @@ This project organizes native functions into fixed layers/modules - one file per
 already exist in the codebase, you're placing new code into one of them, never inventing your own
 module path or writing a bare unqualified reference:
 {layers_block}
+
+IMPORTANT - some pseudocode contains a line like `// TODO sh2_to_rust_pseudo: mnemônico não
+traduzido: UNKNOWN XXXX` or a header `// pendências: opcode desconhecido em ADDR`. This marks a point
+the mechanical disassembler could not statically resolve - confirmed (opcode-by-opcode, against the
+real reference decoder) to be a genuine dead end: on real hardware AND in the reference emulator, the
+CPU fetching an opcode with no defined meaning does NOT continue silently - it raises an illegal-
+instruction exception (saves SR/PC, jumps to the exception vector). Do the equivalent: emit an
+explicit, loud failure at that exact point (e.g. `unreachable!("...")` or `panic!("...")` describing
+what was unresolved) - never invent what the logic "should" do past that point, and never quietly omit
+it either. This does NOT mean skip the function: the address it belongs to is a real, trace-confirmed
+call target (the game genuinely calls it) - implement everything you DO have solid evidence for
+faithfully, and only the specific unresolved branch gets the explicit trap.
 
 Your task:
 1. Re-derive the real subgroups (1 subgroup covering everyone, or up to N subgroups if none share logic).
@@ -304,6 +354,88 @@ def _extract_json(text: str) -> dict:
     return json.loads(text)
 
 
+# Bounded, not unlimited: DeepInfra (or any provider) has real rate limits,
+# and an unbounded `asyncio.gather` over potentially hundreds of clusters
+# would fire them all at once. 8 concurrent requests was picked as a
+# reasonable default matching the same number floated when this concurrency
+# support was requested (2026-08-08) - not measured/tuned beyond that yet.
+POLISH_CONCURRENCY = 8
+
+
+async def _polish_one_cluster(
+    client: httpx.AsyncClient, headers: dict, shared: "DraftSharedContext", cfg: "TargetConfig",
+    system_prompt: str, i: int, cluster: list[str], mechanical: dict, dependencies: dict,
+    polished_so_far: dict,
+) -> tuple[str, dict] | None:
+    """One cluster's full request/response cycle, as a standalone coroutine
+    so `PolishWithLLM` can run several of these concurrently via
+    `asyncio.gather` within one dependency-topological wave (see
+    `_topo_waves`). `polished_so_far` is a snapshot of `ctx.state.polished`
+    taken before the wave started - safe to read from concurrently since
+    nothing in the CURRENT wave writes to it until the whole wave finishes
+    (every cluster in one wave is, by construction, independent of every
+    other cluster in that same wave)."""
+    bodies = []
+    dep_notes = []
+    for addr in cluster:
+        m = mechanical.get(addr)
+        if not m:
+            continue
+        bodies.append(f"--- {addr} ({'complete' if m['resolved'] else 'PARTIAL: ' + m['note']}) ---\n{m['pseudo']}")
+        for dep in sorted(dependencies.get(addr, ())):
+            drafted = _find_drafted(polished_so_far, dep)
+            if drafted:
+                dep_notes.append(f"- {addr} calls {dep}, already drafted earlier in THIS run as "
+                                  f"`{drafted['fn_name']}` ({drafted['dispatch_entry']}) - reuse that "
+                                  f"name/reference, don't invent a new one for the same address.")
+    if not bodies:
+        return None
+    dep_block = ("\n\nKnown dependencies already drafted in this run:\n" + "\n".join(dep_notes)
+                 if dep_notes else "")
+    user_prompt = (
+        f"Suggested group - {len(cluster)} address(es): {', '.join(cluster)}\n\n"
+        + "\n\n".join(bodies) + dep_block
+    )
+    try:
+        resp = await client.post(
+            f"{shared.llm_base_url}/chat/completions",
+            headers=headers,
+            json={
+                "model": shared.llm_model_alias,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                # Deliberately no max_tokens: reasoning models on some
+                # local backends burn real completion tokens on a
+                # "Thinking Process:" preamble before `content` - a cap
+                # here risks truncation mid-reasoning, before the model
+                # ever reaches the answer (finish_reason="length",
+                # content=""). See module docstring point 1 for why the
+                # prompt's split_reason escape hatch matters more than
+                # a token budget for the OTHER failure mode this causes.
+                "temperature": 0.1,
+            },
+        )
+        resp.raise_for_status()
+        resp_json = resp.json()
+        usage = resp_json.get("usage", {})
+        content = resp_json["choices"][0]["message"]["content"]
+        groups = _extract_json(content).get("groups", [])
+        for g in groups:
+            g["dispatch_entry"] = _compute_dispatch_entry(cfg, g)
+    except Exception as e:  # noqa: BLE001 - a failed cluster is reported, not silently dropped
+        groups = [{"addrs": cluster, "code": f"// LLM FAILED: {e}", "dispatch_entry": "", "fn_name": "error"}]
+        usage = {}
+    split_note = f" -> MODEL SPLIT INTO {len(groups)} SUBGROUPS" if len(groups) > 1 else ""
+    cost = usage.get("estimated_cost")
+    cost_note = f", cost=${cost:.6f}" if cost is not None else ""
+    print(f"[PolishWithLLM] cluster {i} ({len(cluster)} addrs, "
+          f"prompt_tokens={usage.get('prompt_tokens', '?')}, "
+          f"completion_tokens={usage.get('completion_tokens', '?')}{cost_note}){split_note}")
+    return f"cluster_{i}", {"input_cluster": cluster, "groups": groups, "usage": usage}
+
+
 @dataclass
 class PolishWithLLM(BaseNode[DraftState]):
     async def run(self, ctx: GraphRunContext[DraftState]) -> "WriteOutput":
@@ -323,65 +455,34 @@ class PolishWithLLM(BaseNode[DraftState]):
             layers_block=layers_block,
         )
         headers = {"Authorization": f"Bearer {shared.llm_api_key}"} if shared.llm_api_key else {}
-        async with httpx.AsyncClient(timeout=300) as client:
-            for i, cluster in enumerate(ctx.state.clusters):
-                bodies = []
-                dep_notes = []
-                for addr in cluster:
-                    m = ctx.state.mechanical.get(addr)
-                    if not m:
-                        continue
-                    bodies.append(f"--- {addr} ({'complete' if m['resolved'] else 'PARTIAL: ' + m['note']}) ---\n{m['pseudo']}")
-                    for dep in sorted(ctx.state.dependencies.get(addr, ())):
-                        drafted = _find_drafted(ctx.state.polished, dep)
-                        if drafted:
-                            dep_notes.append(f"- {addr} calls {dep}, already drafted earlier in THIS run as "
-                                              f"`{drafted['fn_name']}` ({drafted['dispatch_entry']}) - reuse that "
-                                              f"name/reference, don't invent a new one for the same address.")
-                if not bodies:
-                    continue
-                dep_block = ("\n\nKnown dependencies already drafted in this run:\n" + "\n".join(dep_notes)
-                             if dep_notes else "")
-                user_prompt = (
-                    f"Suggested group - {len(cluster)} address(es): {', '.join(cluster)}\n\n"
-                    + "\n\n".join(bodies) + dep_block
+        waves = _topo_waves(ctx.state.clusters, ctx.state.dependencies)
+        print(f"[PolishWithLLM] {len(ctx.state.clusters)} clusters em {len(waves)} onda(s) "
+              f"topológica(s), até {POLISH_CONCURRENCY} chamadas concorrentes por onda")
+        semaphore = asyncio.Semaphore(POLISH_CONCURRENCY)
+
+        async def bounded(i: int, cluster: list[str], polished_snapshot: dict):
+            async with semaphore:
+                return await _polish_one_cluster(
+                    client, headers, shared, cfg, system_prompt, i, cluster,
+                    ctx.state.mechanical, ctx.state.dependencies, polished_snapshot,
                 )
-                try:
-                    resp = await client.post(
-                        f"{shared.llm_base_url}/chat/completions",
-                        headers=headers,
-                        json={
-                            "model": shared.llm_model_alias,
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_prompt},
-                            ],
-                            # Deliberately no max_tokens: reasoning models on some
-                            # local backends burn real completion tokens on a
-                            # "Thinking Process:" preamble before `content` - a cap
-                            # here risks truncation mid-reasoning, before the model
-                            # ever reaches the answer (finish_reason="length",
-                            # content=""). See module docstring point 1 for why the
-                            # prompt's split_reason escape hatch matters more than
-                            # a token budget for the OTHER failure mode this causes.
-                            "temperature": 0.1,
-                        },
-                    )
-                    resp.raise_for_status()
-                    resp_json = resp.json()
-                    usage = resp_json.get("usage", {})
-                    content = resp_json["choices"][0]["message"]["content"]
-                    groups = _extract_json(content).get("groups", [])
-                    for g in groups:
-                        g["dispatch_entry"] = _compute_dispatch_entry(cfg, g)
-                except Exception as e:  # noqa: BLE001 - a failed cluster is reported, not silently dropped
-                    groups = [{"addrs": cluster, "code": f"// LLM FAILED: {e}", "dispatch_entry": "", "fn_name": "error"}]
-                    usage = {}
-                ctx.state.polished[f"cluster_{i}"] = {"input_cluster": cluster, "groups": groups, "usage": usage}
-                split_note = f" -> MODEL SPLIT INTO {len(groups)} SUBGROUPS" if len(groups) > 1 else ""
-                print(f"[PolishWithLLM] cluster {i} ({len(cluster)} addrs, "
-                      f"prompt_tokens={usage.get('prompt_tokens', '?')}, "
-                      f"completion_tokens={usage.get('completion_tokens', '?')}){split_note}")
+
+        async with httpx.AsyncClient(timeout=300) as client:
+            for wave in waves:
+                # Snapshot BEFORE firing the wave's concurrent requests - every
+                # cluster in this wave only ever needs to see PRIOR waves'
+                # results (that's what makes them independent enough to run
+                # concurrently in the first place), never each other's
+                # still-in-flight ones.
+                polished_snapshot = dict(ctx.state.polished)
+                results = await asyncio.gather(
+                    *(bounded(i, ctx.state.clusters[i], polished_snapshot) for i in wave)
+                )
+                for result in results:
+                    if result is None:
+                        continue
+                    key, value = result
+                    ctx.state.polished[key] = value
         return WriteOutput()
 
 
@@ -389,11 +490,20 @@ class PolishWithLLM(BaseNode[DraftState]):
 class WriteOutput(BaseNode[DraftState]):
     async def run(self, ctx: GraphRunContext[DraftState]) -> "WriteAndVerify | End[dict]":
         total_prompt_tok, total_completion_tok, n_splits = 0, 0, 0
+        total_cost = 0.0
+        have_cost = False  # tracks whether ANY call actually reported a real
+                            # cost, so a provider that never sends this field
+                            # (usage.estimated_cost is DeepInfra-specific, not
+                            # a standard OpenAI response field) reports "n/a"
+                            # instead of a misleading "$0.00".
         code_blocks, dispatch_entries = [], []
         for key, p in ctx.state.polished.items():
             usage = p.get("usage", {})
             total_prompt_tok += usage.get("prompt_tokens", 0)
             total_completion_tok += usage.get("completion_tokens", 0)
+            if usage.get("estimated_cost") is not None:
+                total_cost += usage["estimated_cost"]
+                have_cost = True
             groups = p.get("groups", [])
             if len(groups) > 1:
                 n_splits += 1
@@ -410,6 +520,7 @@ class WriteOutput(BaseNode[DraftState]):
             "n_model_splits": n_splits,
             "prompt_tokens": total_prompt_tok,
             "completion_tokens": total_completion_tok,
+            "estimated_cost_usd": total_cost if have_cost else None,
             "code": "\n\n".join(code_blocks),
             "dispatch_entries": dispatch_entries,
             "mechanical": ctx.state.mechanical,
@@ -418,10 +529,11 @@ class WriteOutput(BaseNode[DraftState]):
             "dependencies": {a: sorted(d) for a, d in ctx.state.dependencies.items() if d},
             "external_dependencies": {a: sorted(d) for a, d in ctx.state.external_dependencies.items() if d},
         }
+        cost_line = f"${total_cost:.6f} (real, via usage.estimated_cost)" if have_cost else "n/a (provider didn't report it)"
         print(f"[WriteOutput] {summary['n_targets']} alvos -> {summary['n_mechanical']} desmontados -> "
               f"{summary['n_clusters']} clusters -> {summary['n_llm_calls']} chamadas ao LLM "
               f"({summary['n_model_splits']} split(s)). "
-              f"TOKENS: {total_prompt_tok} entrada / {total_completion_tok} saída.")
+              f"TOKENS: {total_prompt_tok} entrada / {total_completion_tok} saída. CUSTO: {cost_line}.")
         ctx.state.summary = summary
         if ctx.state.shared.write_and_verify:
             return WriteAndVerify()
